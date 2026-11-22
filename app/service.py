@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import asyncio
 import math
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv4Network
 from typing import Mapping
 
-from .errors import SessionConflict, UnknownNeighbor
+from .errors import (
+    DuplicateSnapshotPrefix,
+    EndOfRibPending,
+    ReconciliationTicketInvalid,
+    SessionConflict,
+    UnknownNeighbor,
+)
 
 
 def _utcnow() -> datetime:
@@ -45,6 +52,7 @@ class NeighborState:
     timer: asyncio.TimerHandle | None = None
     last_cleanup_reason: str | None = None
     last_cleanup_at: datetime | None = None
+    reconciliation: ReconciliationState | None = None
 
     @property
     def pending_count(self) -> int:
@@ -57,6 +65,32 @@ class NeighborState:
     @property
     def converging(self) -> bool:
         return self.grace_expires_at is not None and not self.end_of_rib_received
+
+
+@dataclass(frozen=True)
+class TouchedAction:
+    """The last valid live message received for one prefix during a
+    reconciliation window: either an announcement (with its next hop) or a
+    withdrawal."""
+
+    kind: str  # "announce" | "withdraw"
+    next_hop: IPv4Address | None
+
+
+@dataclass
+class ReconciliationState:
+    """One open reconciliation window for a neighbor.
+
+    ``touched`` maps each prefix that saw a valid live update since the
+    ticket was issued to the latest action, so memory grows only with the
+    number of distinct prefixes, not with the number of messages.
+    """
+
+    ticket: str
+    session_id: int
+    generation: int
+    issued_at: datetime
+    touched: dict[IPv4Network, TouchedAction] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -100,6 +134,40 @@ class EndOfRibResult:
     purged_pending: int
     pending_remaining: int
     confirmed_remaining: int
+    revision: int
+
+
+@dataclass(frozen=True)
+class ReconciliationIssueResult:
+    neighbor: IPv4Address
+    session_id: int
+    ticket: str
+    issued_at: datetime
+    revision: int
+
+
+@dataclass(frozen=True)
+class ReconciliationSubmitResult:
+    neighbor: IPv4Address
+    session_id: int
+    ticket: str
+    added: int
+    removed: int
+    changed: int
+    kept: int
+    live_override_prefixes: int
+    route_count: int
+    revision: int
+
+
+@dataclass(frozen=True)
+class ReconciliationStatus:
+    neighbor: IPv4Address
+    active: bool
+    session_id: int | None
+    ticket: str | None
+    issued_at: datetime | None
+    tracked_prefixes: int
     revision: int
 
 
@@ -236,6 +304,8 @@ class RouteService:
                 # The superseded timer must never touch the table.
                 state.timer.cancel()
                 state.timer = None
+            # A reconnect invalidates any open reconciliation ticket.
+            state.reconciliation = None
             # Every route from the old session stays visible, but pending.
             for route in state.routes.values():
                 route.pending = True
@@ -295,6 +365,7 @@ class RouteService:
                 announced_session=session_id,
                 updated_at=now,
             )
+            self._track_live_update(state, prefix, TouchedAction("announce", next_hop))
         self._revision += 1
         return AnnounceResult(
             neighbor=neighbor,
@@ -323,6 +394,10 @@ class RouteService:
                 removed += 1
             else:
                 not_present.append(prefix)
+            # A valid withdrawal counts even when the prefix is already gone
+            # from the table: during a reconciliation window it must still
+            # overrule the snapshot for that prefix.
+            self._track_live_update(state, prefix, TouchedAction("withdraw", None))
         self._revision += 1
         return WithdrawResult(
             neighbor=neighbor,
@@ -350,6 +425,162 @@ class RouteService:
             purged_pending=purged,
             pending_remaining=state.pending_count,
             confirmed_remaining=state.confirmed_count,
+            revision=self._revision,
+        )
+
+    # ---------------------------------------------------------- reconciliation
+    def issue_reconciliation(self, neighbor: IPv4Address) -> ReconciliationIssueResult:
+        """Open a reconciliation window and hand out its ticket.
+
+        Only the neighbor's current session qualifies, and only after its
+        End-of-RIB: before that the online table is still converging, so a
+        device snapshot cannot be told apart from in-flight updates.  Issuing
+        a new ticket supersedes any ticket still open for this neighbor.
+        """
+        state = self._neighbors.get(neighbor)
+        if state is None:
+            raise UnknownNeighbor(neighbor)
+        if not state.end_of_rib_received:
+            raise EndOfRibPending(neighbor, state.session_id)
+        reconciliation = ReconciliationState(
+            ticket=f"rec-{secrets.token_hex(8)}",
+            session_id=state.session_id,
+            generation=state.generation,
+            issued_at=_utcnow(),
+        )
+        state.reconciliation = reconciliation
+        # Issuing a ticket does not change the table, so the revision stays.
+        return ReconciliationIssueResult(
+            neighbor=neighbor,
+            session_id=reconciliation.session_id,
+            ticket=reconciliation.ticket,
+            issued_at=reconciliation.issued_at,
+            revision=self._revision,
+        )
+
+    def submit_reconciliation(
+        self,
+        neighbor: IPv4Address,
+        ticket: str,
+        routes: list[tuple[IPv4Network, IPv4Address]],
+    ) -> ReconciliationSubmitResult:
+        """Reconcile the neighbor's table against a full device snapshot.
+
+        Prefixes that saw a valid live update since the ticket was issued
+        follow the last such message (an announcement keeps its announced
+        next hop, a withdrawal keeps the prefix absent — even if the snapshot
+        still lists it).  Every other prefix follows the snapshot: missing
+        routes are added, diverging next hops are corrected, and online
+        routes absent from the snapshot are removed.  The whole correction
+        lands as one batch; the ticket is consumed on success.
+        """
+        state = self._neighbors.get(neighbor)
+        if state is None:
+            raise UnknownNeighbor(neighbor)
+        reconciliation = state.reconciliation
+        if (
+            reconciliation is None
+            or reconciliation.ticket != ticket
+            or reconciliation.session_id != state.session_id
+            or reconciliation.generation != state.generation
+        ):
+            raise ReconciliationTicketInvalid(neighbor, ticket)
+
+        snapshot: dict[IPv4Network, IPv4Address] = {}
+        duplicates: list[IPv4Network] = []
+        for prefix, next_hop in routes:
+            if prefix in snapshot:
+                duplicates.append(prefix)
+            else:
+                snapshot[prefix] = next_hop
+        if duplicates:
+            # Rejected before any table change; the ticket stays valid so the
+            # collector can fix the snapshot and resubmit.
+            raise DuplicateSnapshotPrefix(neighbor, duplicates)
+
+        now = _utcnow()
+        desired: dict[IPv4Network, Route] = {}
+
+        def _fresh(prefix: IPv4Network, next_hop: IPv4Address) -> Route:
+            return Route(
+                prefix=prefix,
+                next_hop=next_hop,
+                neighbor=neighbor,
+                pending=False,
+                announced_session=state.session_id,
+                updated_at=now,
+            )
+
+        # 1. Prefixes touched by live updates during the window: the last
+        #    message decides, whatever the snapshot says.
+        for prefix, action in reconciliation.touched.items():
+            if action.kind == "announce":
+                assert action.next_hop is not None
+                desired[prefix] = _fresh(prefix, action.next_hop)
+            # "withdraw": the prefix stays out of the desired table.
+
+        # 2. Untouched prefixes: the snapshot is authoritative.
+        for prefix, next_hop in snapshot.items():
+            if prefix not in reconciliation.touched:
+                desired[prefix] = _fresh(prefix, next_hop)
+
+        # Untouched routes missing from the snapshot are simply not carried
+        # over, which removes them.  Unchanged routes keep their original
+        # Route object (and history).
+        added = removed = changed = kept = 0
+        final: dict[IPv4Network, Route] = {}
+        for prefix, route in desired.items():
+            existing = state.routes.get(prefix)
+            if existing is None:
+                added += 1
+                final[prefix] = route
+            elif existing.next_hop != route.next_hop or existing.pending:
+                changed += 1
+                final[prefix] = route
+            else:
+                kept += 1
+                final[prefix] = existing
+        removed = sum(1 for prefix in state.routes if prefix not in desired)
+
+        state.routes = final  # the whole correction takes effect at once
+        state.reconciliation = None  # a successful submission consumes the ticket
+        self._revision += 1
+        return ReconciliationSubmitResult(
+            neighbor=neighbor,
+            session_id=state.session_id,
+            ticket=ticket,
+            added=added,
+            removed=removed,
+            changed=changed,
+            kept=kept,
+            live_override_prefixes=len(reconciliation.touched),
+            route_count=len(final),
+            revision=self._revision,
+        )
+
+    def reconciliation_status(self, neighbor: IPv4Address) -> ReconciliationStatus:
+        """Report the neighbor's open reconciliation window, if any."""
+        state = self._neighbors.get(neighbor)
+        if state is None:
+            raise UnknownNeighbor(neighbor)
+        reconciliation = state.reconciliation
+        if reconciliation is None:
+            return ReconciliationStatus(
+                neighbor=neighbor,
+                active=False,
+                session_id=None,
+                ticket=None,
+                issued_at=None,
+                tracked_prefixes=0,
+                revision=self._revision,
+            )
+        return ReconciliationStatus(
+            neighbor=neighbor,
+            active=True,
+            session_id=reconciliation.session_id,
+            ticket=reconciliation.ticket,
+            issued_at=reconciliation.issued_at,
+            tracked_prefixes=len(reconciliation.touched),
             revision=self._revision,
         )
 
@@ -426,6 +657,17 @@ class RouteService:
         )
 
     # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _track_live_update(
+        state: NeighborState, prefix: IPv4Network, action: TouchedAction
+    ) -> None:
+        """Record the latest live action per prefix while a reconciliation
+        window is open.  One dict slot per distinct prefix, so memory tracks
+        the number of distinct prefixes, not the number of messages."""
+        reconciliation = state.reconciliation
+        if reconciliation is not None:
+            reconciliation.touched[prefix] = action
+
     def _require_current(
         self, neighbor: IPv4Address, session_id: int
     ) -> NeighborState:

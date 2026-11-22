@@ -98,6 +98,32 @@ class EndOfRibRequest(BaseModel):
     )
 
 
+class ReconciliationSubmitRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "ticket": "rec-4f2a91c0b7e53d08",
+                "routes": [
+                    {"prefix": "203.0.113.0/24", "next_hop": "10.0.0.1"},
+                    {"prefix": "198.51.100.0/24", "next_hop": "10.0.0.9"},
+                ],
+            }
+        }
+    )
+
+    ticket: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Ticket returned when the reconciliation window was opened.",
+    )
+    routes: list[RouteAnnouncement] = Field(
+        max_length=10000,
+        description="The device's full IPv4 table: every prefix it currently "
+        "originates, with its next hop. An empty list means the device holds "
+        "no prefixes. Duplicate prefixes are rejected.",
+    )
+
+
 class LookupRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
@@ -275,6 +301,37 @@ class EndOfRibResponse(ResponseModel):
     purged_pending: int
     pending_remaining: int
     confirmed_remaining: int
+    revision: int
+
+
+class ReconciliationIssueResponse(ResponseModel):
+    neighbor: IPv4Address
+    session_id: int
+    ticket: str
+    issued_at: datetime
+    revision: int
+
+
+class ReconciliationSubmitResponse(ResponseModel):
+    neighbor: IPv4Address
+    session_id: int
+    ticket: str
+    added: int
+    removed: int
+    changed: int
+    kept: int
+    live_override_prefixes: int
+    route_count: int
+    revision: int
+
+
+class ReconciliationStatusResponse(ResponseModel):
+    neighbor: IPv4Address
+    active: bool
+    session_id: int | None = None
+    ticket: str | None = None
+    issued_at: datetime | None = None
+    tracked_prefixes: int = 0
     revision: int
 
 

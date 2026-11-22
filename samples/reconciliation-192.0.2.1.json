@@ -1,0 +1,9 @@
+{
+  "ticket": "PASTE-TICKET-FROM-ISSUE-RESPONSE",
+  "routes": [
+    {"prefix": "203.0.113.0/24", "next_hop": "10.0.0.1"},
+    {"prefix": "198.51.100.0/24", "next_hop": "10.0.0.9"},
+    {"prefix": "198.51.100.128/25", "next_hop": "10.0.0.1"},
+    {"prefix": "192.0.2.0/24", "next_hop": "10.0.0.1"}
+  ]
+}

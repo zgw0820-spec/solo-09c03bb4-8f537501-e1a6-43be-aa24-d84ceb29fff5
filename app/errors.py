@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, IPv4Network
 
 
 class ApiError(Exception):
@@ -70,4 +70,57 @@ class SessionConflict(ApiError):
             current_session=current_session,
             received_session=received_session,
             reason=reason,
+        )
+
+
+class EndOfRibPending(ApiError):
+    """A reconciliation ticket was requested before the session converged."""
+
+    status_code = 409
+    code = "end_of_rib_pending"
+
+    def __init__(self, neighbor: IPv4Address, session_id: int) -> None:
+        super().__init__(
+            f"neighbor {neighbor} session {session_id} has not completed its "
+            "initial update (End-of-RIB); a reconciliation ticket can only be "
+            "issued for the current session once End-of-RIB has been received",
+            neighbor=str(neighbor),
+            session_id=session_id,
+        )
+
+
+class ReconciliationTicketInvalid(ApiError):
+    """The submitted reconciliation ticket is not the neighbor's active one."""
+
+    status_code = 409
+    code = "reconciliation_ticket_invalid"
+
+    def __init__(self, neighbor: IPv4Address, ticket: str) -> None:
+        super().__init__(
+            f"reconciliation ticket {ticket!r} is not active for neighbor "
+            f"{neighbor}; it was never issued, superseded by a newer ticket, "
+            "consumed by a successful submission, or invalidated by a "
+            "reconnect or reset; the online table was left unchanged",
+            neighbor=str(neighbor),
+            ticket=ticket,
+        )
+
+
+class DuplicateSnapshotPrefix(ApiError):
+    """The submitted snapshot lists the same prefix more than once."""
+
+    status_code = 400
+    code = "duplicate_prefix"
+
+    def __init__(
+        self, neighbor: IPv4Address, duplicates: list[IPv4Network]
+    ) -> None:
+        super().__init__(
+            f"snapshot for neighbor {neighbor} lists "
+            f"{len(duplicates)} duplicate prefix(es): "
+            + ", ".join(str(prefix) for prefix in duplicates)
+            + "; the submission was rejected and the online table was "
+            "left unchanged",
+            neighbor=str(neighbor),
+            duplicates=[str(prefix) for prefix in duplicates],
         )

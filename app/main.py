@@ -27,6 +27,10 @@ from .models import (
     MatchView,
     NeighborView,
     NeighborsResponse,
+    ReconciliationIssueResponse,
+    ReconciliationStatusResponse,
+    ReconciliationSubmitRequest,
+    ReconciliationSubmitResponse,
     ReconnectEvent,
     ReconnectRequest,
     ReconnectResponse,
@@ -41,6 +45,9 @@ from .models import (
 from .service import (
     AnnounceResult,
     EndOfRibResult,
+    ReconciliationIssueResult,
+    ReconciliationStatus,
+    ReconciliationSubmitResult,
     ReconnectResult,
     RouteService,
     WithdrawResult,
@@ -62,6 +69,14 @@ Route-visibility service for on-call staff after a BGP neighbor reconnects.
 * `POST /v1/lookup` resolves a batch of destinations against one shared table:
   longest-prefix match, then confirmed-over-pending, then neighbour priority.
   Destinations without a route are reported explicitly as `not_found`.
+* If announcements or withdrawals were missed, the collector can reconcile a
+  neighbour against the device's own table: open a window with
+  `POST /v1/neighbors/{ip}/reconciliation` (only for a session that already
+  sent End-of-RIB), keep feeding live updates — they still apply immediately —
+  then submit the full snapshot with the ticket. Prefixes touched by live
+  updates during the window follow the last message; every other prefix
+  follows the snapshot. The correction lands as one batch and the receipt
+  counts added / removed / changed routes.
 """
 
 
@@ -122,6 +137,49 @@ def _end_of_rib_response(result: EndOfRibResult) -> EndOfRibResponse:
     )
 
 
+def _reconciliation_issue_response(
+    result: ReconciliationIssueResult,
+) -> ReconciliationIssueResponse:
+    return ReconciliationIssueResponse(
+        neighbor=result.neighbor,
+        session_id=result.session_id,
+        ticket=result.ticket,
+        issued_at=result.issued_at,
+        revision=result.revision,
+    )
+
+
+def _reconciliation_submit_response(
+    result: ReconciliationSubmitResult,
+) -> ReconciliationSubmitResponse:
+    return ReconciliationSubmitResponse(
+        neighbor=result.neighbor,
+        session_id=result.session_id,
+        ticket=result.ticket,
+        added=result.added,
+        removed=result.removed,
+        changed=result.changed,
+        kept=result.kept,
+        live_override_prefixes=result.live_override_prefixes,
+        route_count=result.route_count,
+        revision=result.revision,
+    )
+
+
+def _reconciliation_status_response(
+    status: ReconciliationStatus,
+) -> ReconciliationStatusResponse:
+    return ReconciliationStatusResponse(
+        neighbor=status.neighbor,
+        active=status.active,
+        session_id=status.session_id,
+        ticket=status.ticket,
+        issued_at=status.issued_at,
+        tracked_prefixes=status.tracked_prefixes,
+        revision=status.revision,
+    )
+
+
 def _neighbor_view(view) -> NeighborView:
     return NeighborView(
         neighbor=view.neighbor,
@@ -168,6 +226,11 @@ def create_app(
         lifespan=lifespan,
         openapi_tags=[
             {"name": "events", "description": "Collector events, single or batched."},
+            {
+                "name": "reconciliation",
+                "description": "Snapshot-based reconciliation of one neighbour's "
+                "table after missed updates.",
+            },
             {"name": "lookup", "description": "Batch destination lookup."},
             {"name": "admin", "description": "Table inspection and demo reset."},
         ],
@@ -241,6 +304,62 @@ def create_app(
     ) -> EndOfRibResponse:
         result = service.end_of_rib(neighbor, body.session_id)
         return _end_of_rib_response(result)
+
+    # -------------------------------------------------------- reconciliation
+    @app.post(
+        "/v1/neighbors/{neighbor}/reconciliation",
+        response_model=ReconciliationIssueResponse,
+        tags=["reconciliation"],
+        summary="Open a reconciliation window and issue its ticket",
+        description="Only the neighbour's current session qualifies, and only "
+        "after its End-of-RIB. Live announcements and withdrawals keep "
+        "applying while the window is open; the service remembers the last "
+        "message per prefix. Issuing a new ticket invalidates the previous "
+        "one, as do a reconnect, a reset, or a successful submission.",
+        responses={404: {"model": ErrorEnvelope}, 409: {"model": ErrorEnvelope}},
+    )
+    async def open_reconciliation(neighbor: IPv4Address) -> ReconciliationIssueResponse:
+        return _reconciliation_issue_response(service.issue_reconciliation(neighbor))
+
+    @app.get(
+        "/v1/neighbors/{neighbor}/reconciliation",
+        response_model=ReconciliationStatusResponse,
+        tags=["reconciliation"],
+        summary="Status of the neighbour's open reconciliation window",
+        responses={404: {"model": ErrorEnvelope}},
+    )
+    async def reconciliation_status(neighbor: IPv4Address) -> ReconciliationStatusResponse:
+        return _reconciliation_status_response(
+            service.reconciliation_status(neighbor)
+        )
+
+    @app.post(
+        "/v1/neighbors/{neighbor}/reconciliation/submit",
+        response_model=ReconciliationSubmitResponse,
+        tags=["reconciliation"],
+        summary="Submit the device snapshot against a reconciliation ticket",
+        description="Prefixes that saw a valid live update since the ticket "
+        "was issued follow the last message (a withdrawal keeps the prefix out "
+        "even if the snapshot still lists it); every other prefix follows "
+        "the snapshot. The whole correction takes effect as one batch and "
+        "the receipt counts added / removed / changed routes. An invalid "
+        "ticket or a snapshot with duplicate prefixes is rejected and the "
+        "online table is left unchanged.",
+        responses={
+            400: {"model": ErrorEnvelope},
+            404: {"model": ErrorEnvelope},
+            409: {"model": ErrorEnvelope},
+        },
+    )
+    async def submit_reconciliation(
+        neighbor: IPv4Address, body: ReconciliationSubmitRequest
+    ) -> ReconciliationSubmitResponse:
+        result = service.submit_reconciliation(
+            neighbor,
+            body.ticket,
+            [(route.prefix, route.next_hop) for route in body.routes],
+        )
+        return _reconciliation_submit_response(result)
 
     # ----------------------------------------------------------- batch event
     @app.post(

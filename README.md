@@ -37,6 +37,43 @@ shared table revision, then the winner is chosen by:
 
 Destinations with no route are returned explicitly with `status: "not_found"`.
 
+## Snapshot reconciliation
+
+If the collector missed announcements or withdrawals, it can repair the online
+table from the device's own table, per neighbour:
+
+1. **Open a window** — `POST /v1/neighbors/{ip}/reconciliation` issues a
+   reconciliation **ticket**. A ticket can only be issued for the neighbour's
+   **current session after its End-of-RIB**; earlier, the table is still
+   converging and a snapshot could not be told apart from in-flight updates
+   (attempts get 409 `end_of_rib_pending`).
+2. **Fetch the device table** — while the window is open, announcements and
+   withdrawals apply **as usual**. The service remembers the last valid
+   message per prefix; this tracking memory grows only with the number of
+   **distinct prefixes** seen, not with the number of messages.
+3. **Submit the snapshot** — `POST /v1/neighbors/{ip}/reconciliation/submit`
+   with the ticket and the device's full IPv4 prefix/next-hop list:
+   * prefixes touched by live updates during the window follow the **last
+     message** — a withdrawal keeps the prefix out even if the (stale)
+     snapshot still lists it, and even if the prefix was already gone from
+     the table when the withdrawal arrived;
+   * every other prefix follows the **snapshot** — missing routes are added,
+     diverging next hops corrected, online routes absent from the snapshot
+     deleted;
+   * the whole correction takes effect as **one batch** (a single table
+     revision step), and the receipt counts `added` / `removed` / `changed`
+     (plus `kept` and the number of live-overridden prefixes).
+
+A ticket is **invalidated** by a neighbour reconnect, a service reset, a newer
+ticket for the same neighbour, or a successful submission. Submitting with a
+dead ticket (409 `reconciliation_ticket_invalid`) or a snapshot containing
+duplicate prefixes (400 `duplicate_prefix`) is rejected and the online table
+is left unchanged; after a duplicate-prefix rejection the ticket stays valid,
+so the collector can fix the snapshot and resubmit.
+
+`GET /v1/neighbors/{ip}/reconciliation` reports the open window (ticket,
+session, how many distinct prefixes have live overrides so far).
+
 ## Run with Docker Compose
 
 ```bash
@@ -99,6 +136,37 @@ For a clean slate between runs, `POST /v1/admin/reset` clears all state.
 Replaying both sample files after a reset reconstructs the same end state; this
 is asserted by `tests/test_demo_flow.py`.
 
+### Reconciliation demo: a withdrawal lands while the snapshot is fetched
+
+The seed left both neighbours at session 1 with End-of-RIB done, so a
+reconciliation window can be opened immediately.
+
+1. **`POST /v1/neighbors/192.0.2.1/reconciliation`** — no body. The response
+   carries the `ticket` (e.g. `rec-4f2a…`) bound to session 1.
+   `GET /v1/neighbors/192.0.2.1/reconciliation` shows the open window.
+2. **While the collector is "fetching" the device table**, a live withdrawal
+   arrives: **`POST /v1/neighbors/192.0.2.1/withdraw`** with
+   `{"session_id": 1, "prefixes": ["198.51.100.128/25"]}`. It applies at once —
+   `POST /v1/lookup` for `198.51.100.200` now matches the less-specific
+   `198.51.100.0/24`.
+3. **The fetch finishes.** The snapshot was taken *before* the withdrawal, so
+   it still lists the /25 — and it also carries a next-hop change for
+   `198.51.100.0/24` (now `10.0.0.9`) plus a prefix the collector never saw
+   (`192.0.2.0/24`). **`POST /v1/neighbors/192.0.2.1/reconciliation/submit`**
+   with the body from `samples/reconciliation-192.0.2.1.json`, pasting the
+   ticket from step 1 into the `ticket` field.
+4. **The receipt** reports `added: 1` (`192.0.2.0/24`), `changed: 1`
+   (`198.51.100.0/24` next hop), `removed: 0`, `kept: 1`, and
+   `live_override_prefixes: 1`. `GET /v1/routes` confirms the /25 was **not**
+   resurrected by the stale snapshot: the in-window withdrawal won.
+5. **Submit the same ticket again** — 409 `reconciliation_ticket_invalid`;
+   the ticket was consumed by the successful submission.
+
+Also worth trying in Swagger: issue a ticket, then
+`POST /v1/neighbors/192.0.2.1/reconnect` with `{"session_id": 2}` — the ticket
+is dead (submitting it now returns 409), and a fresh ticket cannot be issued
+until the new session's End-of-RIB arrives (409 `end_of_rib_pending`).
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -107,6 +175,9 @@ is asserted by `tests/test_demo_flow.py`.
 | POST | `/v1/neighbors/{ip}/announce` | IPv4 announcements from current session |
 | POST | `/v1/neighbors/{ip}/withdraw` | IPv4 withdrawals from current session |
 | POST | `/v1/neighbors/{ip}/end-of-rib` | Batch-remove this neighbour's pending routes |
+| POST | `/v1/neighbors/{ip}/reconciliation` | Issue a reconciliation ticket (needs End-of-RIB) |
+| GET | `/v1/neighbors/{ip}/reconciliation` | Open-window status and live-override count |
+| POST | `/v1/neighbors/{ip}/reconciliation/submit` | Apply device snapshot as one batch |
 | POST | `/v1/events` | Ordered batch with per-event accept/reject |
 | POST | `/v1/lookup` | Batch longest-prefix lookup, one shared revision |
 | GET | `/v1/routes` | Table snapshot with pending flags |
@@ -116,7 +187,8 @@ is asserted by `tests/test_demo_flow.py`.
 
 Error bodies are always `{"error": {"code", "message", "details"}}`. Relevant
 codes: `stale_session`, `session_not_increasing`, `session_not_established`,
-`unknown_neighbor`.
+`unknown_neighbor`, `end_of_rib_pending`, `reconciliation_ticket_invalid`,
+`duplicate_prefix`.
 
 ## Tests
 
@@ -129,7 +201,10 @@ python -m pytest -q
 `httpx` (installed above). The suite covers longest-prefix selection, priority
 tie-breaks, explicit not-found, pending retention, immediate announce/withdraw,
 batch End-of-RIB cleanup, grace expiry, superseded-timer protection, stale/future
-session rejection, per-neighbour independence and sample replay.
+session rejection, per-neighbour independence, sample replay, and snapshot
+reconciliation (ticket lifecycle and invalidation, last-live-message-wins,
+one-batch add/remove/change receipts, duplicate-prefix and dead-ticket
+rejection, distinct-prefix tracking memory).
 
 `TestClient` drives the app's real lifespan and event loop, so the grace-timer
 tests exercise the same `asyncio` timer path used in production.
